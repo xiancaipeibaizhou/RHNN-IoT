@@ -122,16 +122,25 @@ def get_pyg_data(dataset_name):
             # Assuming 1 node and self-loops or simple structure where we can concat mean/sum
             # Based on previous TGN check, x is [1, 4], edge_attr is [1, 77]
             # We concat them to get 81 features
-            if data.x.shape[0] > 0:
-                x_feat = data.x.mean(dim=0) # Mean pooling if multiple nodes
+            x_feat = None
+            e_feat = None
+
+            if hasattr(data, 'x') and data.x is not None and data.x.numel() > 0:
+                if data.x.dim() == 1:
+                    x_feat = data.x
+                else:
+                    x_feat = data.x.mean(dim=0)
             else:
-                x_feat = torch.zeros(4) # Fallback
-                
-            if data.edge_attr is not None and data.edge_attr.shape[0] > 0:
-                e_feat = data.edge_attr.mean(dim=0) # Mean pooling if multiple edges
+                 x_feat = torch.zeros(4) # Fallback
+
+            if hasattr(data, 'edge_attr') and data.edge_attr is not None and data.edge_attr.numel() > 0:
+                if data.edge_attr.dim() == 1:
+                    e_feat = data.edge_attr
+                else:
+                    e_feat = data.edge_attr.mean(dim=0)
             else:
-                e_feat = torch.zeros(77) # Fallback (should match edge_dim)
-            
+                 e_feat = torch.zeros(77) # Fallback
+
             combined = torch.cat([x_feat, e_feat], dim=0)
             features.append(combined.numpy())
             
@@ -157,7 +166,7 @@ def get_pyg_data(dataset_name):
     if label_encoder_path.exists():
         try:
             with open(label_encoder_path, 'rb') as f:
-                le = pickle.load(f)
+                le = pickle.load(f, encoding='latin1')
                 raw_class_names = le.classes_
             print(f"Loaded class names: {raw_class_names}")
         except Exception as e:
@@ -169,6 +178,15 @@ def get_pyg_data(dataset_name):
                 print(f"Loaded class names with pandas: {raw_class_names}")
             except Exception as e2:
                 print(f"Failed to load label encoder with pandas: {e2}")
+
+    if raw_class_names is None:
+        print("Using numerical class indices as names.")
+        if dataset_name == 'unsw_nb15':
+            print("Trying to use hardcoded class names for UNSW-NB15 (Alphabetical)...")
+            # Standard UNSW-NB15 classes in alphabetical order
+            possible_names = ['Analysis', 'Backdoor', 'DoS', 'Exploits', 'Fuzzers', 'Generic', 'Normal', 'Reconnaissance', 'Shellcode', 'Worms']
+            raw_class_names = possible_names
+            print(f"Using hardcoded class names: {raw_class_names}")
 
     return train_X, train_y, val_X, val_y, test_X, test_y, raw_class_names
 
@@ -214,8 +232,11 @@ def train_etbert(args):
     # Resolve class names
     if raw_class_names is not None:
         # Map unique_labels (which are indices in raw_class_names) to names
-        # Ensure we access raw_class_names with integer indices
-        class_names = [str(raw_class_names[int(l)]) for l in unique_labels]
+        try:
+             class_names = [str(raw_class_names[int(l)]) for l in unique_labels]
+        except IndexError:
+             print("Warning: Unique label index out of range for raw_class_names. Fallback to indices.")
+             class_names = [str(int(l)) for l in unique_labels]
     else:
         class_names = [str(int(l)) for l in unique_labels]
     print(f"Active Class Names: {class_names}")
@@ -254,9 +275,16 @@ def train_etbert(args):
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     criterion = nn.CrossEntropyLoss()
     
-    early_stopper = EarlyStopMonitor(max_round=args.patience, higher_better=True)
+    # Output Directory
+    run_tag = time.strftime("%Y%m%d-%H%M%S")
+    output_dir = os.path.join('baseline', 'ET-BERT', args.dataset, run_tag)
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+    print(f"Output directory: {output_dir}")
     
     # Training Loop
+    best_val_f1 = 0
+    patience_counter = 0
+    best_model_path = os.path.join(output_dir, 'best_model.pth')
     best_model_state = None
     
     for epoch in range(args.n_epoch):
@@ -303,20 +331,27 @@ def train_etbert(args):
               f"Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.4f} | Train F1: {train_f1:.4f} | "
               f"Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f} | Val F1: {val_f1:.4f}")
         
-        if early_stopper.early_stop_check(val_f1):
-            print(f"Early stopping at epoch {epoch+1}")
-            break
-        
-        if val_f1 == early_stopper.last_best:
+        # Early Stopping
+        if val_f1 > best_val_f1:
+            best_val_f1 = val_f1
+            patience_counter = 0
             best_model_state = copy.deepcopy(model.state_dict())
+            torch.save(model.state_dict(), best_model_path)
+            print(f"  New best model saved! F1: {val_f1:.4f}")
+        else:
+            patience_counter += 1
+            if patience_counter >= args.patience:
+                print(f"Early stopping triggered at epoch {epoch+1}")
+                break
             
     # Test with best model
     if best_model_state is not None:
         print("Loading best model for testing...")
         model.load_state_dict(best_model_state)
-        # Save best model
-        output_dir = os.path.join('baseline', 'ET-BERT', args.dataset)
-        Path(output_dir).mkdir(parents=True, exist_ok=True)
+        # Save best model to current run directory
+        torch.save(model.state_dict(), os.path.join(output_dir, 'etbert_best_model.pth'))
+    else:
+        # If no best model found (e.g. 1 epoch), save current
         torch.save(model.state_dict(), os.path.join(output_dir, 'etbert_best_model.pth'))
     
     model.eval()
@@ -394,10 +429,6 @@ def train_etbert(args):
     # Confusion Matrix
     cm_count = confusion_matrix(test_labels, test_preds)
     cm_norm = confusion_matrix(test_labels, test_preds, normalize='true')
-    print("Confusion Matrix (Counts):")
-    print(cm_count)
-    print("Confusion Matrix (Percentages):")
-    print(cm_norm)
     
     # Save Confusion Matrices
     _save_confusion_matrix_image(cm_count, class_names, os.path.join(output_dir, 'confusion_matrix.png'), "Confusion Matrix (Counts)")

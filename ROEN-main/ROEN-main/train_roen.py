@@ -440,7 +440,7 @@ def get_data_roen(dataset_name, seq_len=10):
     if label_encoder_path.exists():
         try:
             with open(label_encoder_path, 'rb') as f:
-                le = pickle.load(f)
+                le = pickle.load(f, encoding='latin1')
                 class_names = list(le.classes_)
             print(f"Loaded class names: {class_names}")
         except Exception as e:
@@ -455,15 +455,18 @@ def get_data_roen(dataset_name, seq_len=10):
 
     if not class_names:
         print("Using numerical class indices as names.")
-        # Fallback handled in main loop if needed, but get_data_roen doesn't return num_classes explicitly (it calculates it).
-        # We'll handle fallback in train_roen.
-        pass
+        if dataset == 'unsw_nb15':
+            print("Trying to use hardcoded class names for UNSW-NB15 (Alphabetical)...")
+            # Standard UNSW-NB15 classes in alphabetical order
+            possible_names = ['Analysis', 'Backdoor', 'DoS', 'Exploits', 'Fuzzers', 'Generic', 'Normal', 'Reconnaissance', 'Shellcode', 'Worms']
+            class_names = possible_names
+            print(f"Using hardcoded class names: {class_names}")
 
     tr_X, tr_E, tr_M, tr_Y = process_split(train_list, seq_len)
     va_X, va_E, va_M, va_Y = process_split(val_list, seq_len)
     te_X, te_E, te_M, te_Y = process_split(test_list, seq_len)
     
-    return (tr_X, tr_E, tr_M, tr_Y), (va_X, va_E, va_M, va_Y), (te_X, te_E, te_M, te_Y), num_nodes, raw_class_names
+    return (tr_X, tr_E, tr_M, tr_Y), (va_X, va_E, va_M, va_Y), (te_X, te_E, te_M, te_Y), num_nodes, class_names
 
 # --- Main Training Loop ---
 
@@ -471,7 +474,7 @@ def train_roen(args):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     
-    (tr_X, tr_E, tr_M, tr_Y), (va_X, va_E, va_M, va_Y), (te_X, te_E, te_M, te_Y), num_nodes, raw_class_names = \
+    (tr_X, tr_E, tr_M, tr_Y), (va_X, va_E, va_M, va_Y), (te_X, te_E, te_M, te_Y), num_nodes, class_names = \
         get_data_roen(args.dataset, args.seq_len)
         
     print(f"Train size: {len(tr_X)}")
@@ -742,11 +745,11 @@ if __name__ == "__main__":
     parser.add_argument('--n_epoch', type=int, default=50)
     parser.add_argument('--bs', type=int, default=32)
     parser.add_argument('--lr', type=float, default=1e-3)
-    parser.add_argument('--hidden_dim', type=int, default=64)
-    parser.add_argument('--seq_len', type=int, default=10)
-    parser.add_argument('--dropout', type=float, default=0.1)
-    parser.add_argument('--patience', type=int, default=5)
-    parser.add_argument('--weight_decay', type=float, default=1e-4)
+    parser.add_argument('--hidden_dim', type=int, default=64, help='Hidden dimension')
+    parser.add_argument('--seq_len', type=int, default=10, help='Sequence length')
+    parser.add_argument('--dropout', type=float, default=0.2, help='Dropout rate')
+    parser.add_argument('--patience', type=int, default=10, help='Early stopping patience')
+    parser.add_argument('--weight_decay', type=float, default=5e-4, help='Weight decay')
     
     args = parser.parse_args()
     train_roen(args)

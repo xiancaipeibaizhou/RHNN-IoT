@@ -104,7 +104,7 @@ def get_pyg_data(dataset_name):
     if label_encoder_path.exists():
         try:
             with open(label_encoder_path, 'rb') as f:
-                le = pickle.load(f)
+                le = pickle.load(f, encoding='latin1')
                 class_names = le.classes_
             print(f"Loaded class names: {class_names}")
         except Exception as e:
@@ -116,6 +116,15 @@ def get_pyg_data(dataset_name):
                 print(f"Loaded class names with pandas: {class_names}")
             except Exception as e2:
                 print(f"Failed to load label encoder with pandas: {e2}")
+
+    if not len(class_names):
+        print("Using numerical class indices as names.")
+        if dataset_name == 'unsw_nb15':
+            print("Trying to use hardcoded class names for UNSW-NB15 (Alphabetical)...")
+            # Standard UNSW-NB15 classes in alphabetical order
+            possible_names = ['Analysis', 'Backdoor', 'DoS', 'Exploits', 'Fuzzers', 'Generic', 'Normal', 'Reconnaissance', 'Shellcode', 'Worms']
+            class_names = possible_names
+            print(f"Using hardcoded class names: {class_names}")
 
     # Combine all lists to build node mapping
     all_data = train_list + val_list + test_list
@@ -132,47 +141,92 @@ def get_pyg_data(dataset_name):
     edge_features_list = []
     
     # Process all data sequentially
-    # Assign sequential timestamps: 0, 1, 2...
-    # Treat each graph as one event: source = n_id[0], dest = n_id[0] (self-loop)
-    # Edge features = cat(x, edge_attr)
+    # Treat each edge in the graph as an interaction event
+    
+    current_edge_idx = 0
+    num_train_edges = 0
+    num_val_edges = 0
+    num_test_edges = 0
     
     for i, data in enumerate(all_data):
-        # Get node ID (assume first element of n_id is the target node)
-        if data.n_id.dim() == 0:
-            raw_id = data.n_id.item()
-        else:
-            raw_id = data.n_id[0].item()
+        num_edges = data.edge_index.size(1)
+        if num_edges == 0:
+            continue
             
-        if raw_id not in node_map:
-            node_map[raw_id] = next_id
-            next_id += 1
+        # Count edges for split
+        if i < len(train_list):
+            num_train_edges += num_edges
+        elif i < len(train_list) + len(val_list):
+            num_val_edges += num_edges
+        else:
+            num_test_edges += num_edges
+            
+        # Map local node indices to global unique IDs
+        if hasattr(data, 'n_id'):
+            global_ids = data.n_id.numpy()
+        else:
+            # Fallback if n_id is missing (should not happen with generate_nb15_dataset.py)
+            global_ids = np.arange(data.num_nodes)
+            
+        # Map to TGN's internal node ID space
+        mapped_ids = []
+        for gid in global_ids:
+            if gid not in node_map:
+                node_map[gid] = next_id
+                next_id += 1
+            mapped_ids.append(node_map[gid])
+        mapped_ids = np.array(mapped_ids)
         
-        mapped_id = node_map[raw_id]
+        # Get source and destination nodes
+        src_local = data.edge_index[0].numpy()
+        dst_local = data.edge_index[1].numpy()
         
-        sources.append(mapped_id)
-        destinations.append(mapped_id) # Self-loop
-        timestamps.append(float(i)) # Sequential time
-        edge_idxs.append(i) # Sequential edge index
+        src_tgn = mapped_ids[src_local]
+        dst_tgn = mapped_ids[dst_local]
+        
+        sources.extend(src_tgn)
+        destinations.extend(dst_tgn)
+        
+        # Timestamps: use 'i' as base time (minute index)
+        timestamps.extend([float(i)] * num_edges)
+        
+        # Edge indices
+        edge_idxs.extend(range(current_edge_idx, current_edge_idx + num_edges))
+        current_edge_idx += num_edges
         
         # Labels
-        if hasattr(data, 'y') and data.y is not None:
-             # Handle if y is a tensor
+        if hasattr(data, 'edge_labels') and data.edge_labels is not None:
+             labels.extend(data.edge_labels.numpy())
+        elif hasattr(data, 'y') and data.y is not None:
+             # Fallback if only graph label exists
              lbl = data.y.item() if data.y.numel() == 1 else data.y[0].item()
-             labels.append(lbl)
-        elif hasattr(data, 'edge_labels') and data.edge_labels is not None:
-             lbl = data.edge_labels.item() if data.edge_labels.numel() == 1 else data.edge_labels[0].item()
-             labels.append(lbl)
+             labels.extend([lbl] * num_edges)
         else:
-             labels.append(0) # Default
+             labels.extend([0] * num_edges)
              
         # Features
-        # Combine x (node feat) and edge_attr
-        # x: [1, 4], edge_attr: [1, 77] -> [81]
-        x_feat = data.x[0] if data.x.dim() == 2 else data.x
-        e_feat = data.edge_attr[0] if data.edge_attr.dim() == 2 else data.edge_attr
-        
-        combined_feat = torch.cat([x_feat, e_feat], dim=0).numpy()
-        edge_features_list.append(combined_feat)
+        # Combine src node features and edge features
+        if hasattr(data, 'x') and data.x is not None:
+            # data.x: [N, 4] -> select by src_local -> [E, 4]
+            src_x = data.x[src_local]
+            e_feat = data.edge_attr # [E, 77]
+            
+            # Handle dimension mismatch if necessary (e.g. if x is 1D)
+            if src_x.dim() == 1:
+                src_x = src_x.unsqueeze(0).repeat(num_edges, 1)
+            if e_feat.dim() == 1:
+                e_feat = e_feat.unsqueeze(0).repeat(num_edges, 1)
+                
+            combined = torch.cat([src_x, e_feat], dim=1).numpy()
+            edge_features_list.append(combined)
+        elif hasattr(data, 'edge_attr') and data.edge_attr is not None:
+            edge_features_list.append(data.edge_attr.numpy())
+        else:
+            # Dummy features
+            edge_features_list.append(np.zeros((num_edges, 81), dtype=np.float32))
+            
+        if (i + 1) % 100 == 0:
+            print(f"Processed {i + 1}/{len(all_data)} time slices...")
         
     # Convert to numpy
     sources = np.array(sources)
@@ -180,7 +234,7 @@ def get_pyg_data(dataset_name):
     timestamps = np.array(timestamps)
     edge_idxs = np.array(edge_idxs)
     labels = np.array(labels)
-    edge_features = np.stack(edge_features_list)
+    edge_features = np.concatenate(edge_features_list, axis=0)
     
     # Remap labels to 0..K-1
     unique_labels = np.unique(labels)
@@ -188,6 +242,21 @@ def get_pyg_data(dataset_name):
     labels = np.array([label_map[l] for l in labels])
     print(f"Remapped labels: {unique_labels} -> {np.unique(labels)}")
     
+    # Update class names based on remapping
+    # Filter class_names to only include present labels
+    if len(class_names) > 0:
+        # Check if class_names length matches max label index + 1
+        # Original labels are indices into class_names
+        # We need to keep only those that appear in unique_labels
+        new_class_names = []
+        for original_label in unique_labels:
+            if original_label < len(class_names):
+                new_class_names.append(class_names[original_label])
+            else:
+                new_class_names.append(str(original_label))
+        class_names = new_class_names
+        print(f"Updated class names: {class_names}")
+
     # Node features: Initialize with zeros or random
     # Since we combined x into edge features, we can use dummy node features
     # But TGN expects node features. Let's use zeros.
@@ -199,26 +268,27 @@ def get_pyg_data(dataset_name):
     node_features = np.zeros((num_nodes, edge_features.shape[1]), dtype=np.float32)
     
     # Create Data objects for train/val/test
-    num_train = len(train_list)
-    num_val = len(val_list)
-    num_test = len(test_list)
+    # Use calculated edge counts for splitting
     
     full_data = TGNData(sources, destinations, timestamps, edge_idxs, labels)
     
-    train_data = TGNData(sources[:num_train], destinations[:num_train], 
-                         timestamps[:num_train], edge_idxs[:num_train], labels[:num_train])
+    train_end = num_train_edges
+    val_end = num_train_edges + num_val_edges
+    
+    train_data = TGNData(sources[:train_end], destinations[:train_end], 
+                         timestamps[:train_end], edge_idxs[:train_end], labels[:train_end])
                          
-    val_data = TGNData(sources[num_train:num_train+num_val], 
-                       destinations[num_train:num_train+num_val],
-                       timestamps[num_train:num_train+num_val],
-                       edge_idxs[num_train:num_train+num_val],
-                       labels[num_train:num_train+num_val])
+    val_data = TGNData(sources[train_end:val_end], 
+                       destinations[train_end:val_end],
+                       timestamps[train_end:val_end],
+                       edge_idxs[train_end:val_end],
+                       labels[train_end:val_end])
                        
-    test_data = TGNData(sources[num_train+num_val:], 
-                        destinations[num_train+num_val:],
-                        timestamps[num_train+num_val:],
-                        edge_idxs[num_train+num_val:],
-                        labels[num_train+num_val:])
+    test_data = TGNData(sources[val_end:], 
+                        destinations[val_end:],
+                        timestamps[val_end:],
+                        edge_idxs[val_end:],
+                        labels[val_end:])
     
     if len(class_names) == 0:
         class_names = [str(i) for i in range(len(unique_labels))]
@@ -350,21 +420,72 @@ def train_tgn(args):
         val_acc, val_f1, val_loss = eval_tgn(tgn, decoder, val_data, full_ngh_finder, device, args, criterion)
         print(f"Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f} | Val F1: {val_f1:.4f}")
         
-        if early_stopper.early_stop_check(val_f1):
-            print("Early stopping!")
-            break
-            
         if val_f1 > best_val_f1:
             best_val_f1 = val_f1
-            
+            patience_counter = 0
             torch.save(tgn.state_dict(), os.path.join(output_dir, 'tgn_best_model.pth'))
             torch.save(decoder.state_dict(), os.path.join(output_dir, 'tgn_best_decoder.pth'))
+            print(f"  New best model saved! F1: {val_f1:.4f}")
+        else:
+            patience_counter += 1
+            if patience_counter >= args.patience:
+                print(f"Early stopping triggered at epoch {epoch+1}")
+                break
             
     # Test
     print("Loading best model for testing...")
     
     tgn.load_state_dict(torch.load(os.path.join(output_dir, 'tgn_best_model.pth')))
     decoder.load_state_dict(torch.load(os.path.join(output_dir, 'tgn_best_decoder.pth')))
+
+    # Warm-up Memory
+    print("Warming up TGN memory with training and validation data...")
+    tgn.eval()
+    decoder.eval()
+    tgn.memory.__init_memory__()
+    
+    with torch.no_grad():
+        # Warm-up on Train
+        num_batch = math.ceil(len(train_data.sources) / args.bs)
+        for k in range(num_batch):
+             s_idx = k * args.bs
+             e_idx = min(len(train_data.sources), s_idx + args.bs)
+             
+             sources_batch = train_data.sources[s_idx:e_idx]
+             destinations_batch = train_data.destinations[s_idx:e_idx]
+             timestamps_batch = train_data.timestamps[s_idx:e_idx]
+             edge_idxs_batch = train_data.edge_idxs[s_idx:e_idx]
+             
+             sources_batch = torch.tensor(sources_batch, dtype=torch.long).to(device)
+             destinations_batch = torch.tensor(destinations_batch, dtype=torch.long).to(device)
+             timestamps_batch = torch.tensor(timestamps_batch, dtype=torch.float).to(device)
+             edge_idxs_batch = torch.tensor(edge_idxs_batch, dtype=torch.long).to(device)
+             
+             tgn.compute_temporal_embeddings(sources_batch, destinations_batch, 
+                                            destinations_batch, timestamps_batch, 
+                                            edge_idxs_batch, n_neighbors=20)
+        
+        # Warm-up on Val
+        num_batch = math.ceil(len(val_data.sources) / args.bs)
+        for k in range(num_batch):
+             s_idx = k * args.bs
+             e_idx = min(len(val_data.sources), s_idx + args.bs)
+             
+             sources_batch = val_data.sources[s_idx:e_idx]
+             destinations_batch = val_data.destinations[s_idx:e_idx]
+             timestamps_batch = val_data.timestamps[s_idx:e_idx]
+             edge_idxs_batch = val_data.edge_idxs[s_idx:e_idx]
+             
+             sources_batch = torch.tensor(sources_batch, dtype=torch.long).to(device)
+             destinations_batch = torch.tensor(destinations_batch, dtype=torch.long).to(device)
+             timestamps_batch = torch.tensor(timestamps_batch, dtype=torch.float).to(device)
+             edge_idxs_batch = torch.tensor(edge_idxs_batch, dtype=torch.long).to(device)
+             
+             tgn.compute_temporal_embeddings(sources_batch, destinations_batch, 
+                                            destinations_batch, timestamps_batch, 
+                                            edge_idxs_batch, n_neighbors=20)
+
+    print("Memory warm-up complete. Starting evaluation on Test set...")
     
     test_acc, test_f1, test_loss, test_preds, test_labels, test_probs = eval_tgn(tgn, decoder, test_data, full_ngh_finder, device, args, criterion, return_preds=True)
     
@@ -476,7 +597,7 @@ def eval_tgn(tgn, decoder, data, ngh_finder, device, args, criterion, return_pre
 if __name__ == '__main__':
     parser = argparse.ArgumentParser('TGN training')
     parser.add_argument('--dataset', type=str, default='unsw_nb15')
-    parser.add_argument('--bs', type=int, default=32)
+    parser.add_argument('--bs', type=int, default=2000)
     parser.add_argument('--n_epoch', type=int, default=50)
     parser.add_argument('--n_layer', type=int, default=1)
     parser.add_argument('--n_head', type=int, default=2)
@@ -495,7 +616,8 @@ if __name__ == '__main__':
     parser.add_argument('--use_destination_embedding_in_message', action='store_true', default=False)
     parser.add_argument('--use_source_embedding_in_message', action='store_true', default=False)
     parser.add_argument('--dyrep', action='store_true', default=False)
-    
+    # parser.add_argument('--patience', type=int, default=10, help='Early stopping patience')
+
     args = parser.parse_args()
     
     # Create results dir
